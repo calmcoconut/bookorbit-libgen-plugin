@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 import plugin, * as namedExports from './index.mjs';
 
@@ -645,6 +646,69 @@ async function runAllTests() {
     assert.equal(parseSize('1.024,50 KB'), 1049088);
     assert.equal(parseSize('1,000 KB'), 1024000);
     assert.equal(parseSize('2,5 GB'), 2684354560);
+  });
+
+  await test('stripTags: preserves malformed markup and handles unmatched tags in linear time', () => {
+    assert.equal(namedExports.stripTags('before<b>bold</b>after<unclosed'), 'beforeboldafter<unclosed');
+    assert.equal(namedExports.stripTags('a<<nested>b'), 'ab');
+    // Isolate the adversarial input so a regex regression cannot hang the suite.
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import { stripTags } from ${JSON.stringify(new URL('./index.mjs', import.meta.url).href)};
+       const input = '<'.repeat(512 * 1024);
+       if (stripTags(input) !== input) process.exit(1);`], { timeout: 5000 });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 0, child.stderr?.toString());
+  });
+
+  await test('HTML limit: buffered UTF-8 and declared oversized responses are rejected', async () => {
+    const { readBoundedHtml, MAX_HTML_BYTES } = namedExports;
+    assert.equal(await readBoundedHtml({ text: async () => 'x'.repeat(MAX_HTML_BYTES) }), 'x'.repeat(MAX_HTML_BYTES));
+    await assert.rejects(readBoundedHtml({ text: async () => 'x'.repeat(MAX_HTML_BYTES + 1) }), /512 KiB/);
+    await assert.rejects(readBoundedHtml({ text: async () => 'é'.repeat(MAX_HTML_BYTES / 2 + 1) }), /512 KiB/);
+    await assert.rejects(readBoundedHtml({
+      headers: { get: () => String(MAX_HTML_BYTES + 1) },
+      text: async () => { throw new Error('Must reject before reading'); },
+    }), /512 KiB/);
+  });
+
+  await test('HTML limit: oversized streams are cancelled even with a false Content-Length', async () => {
+    let cancelled = false;
+    let reads = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        reads++;
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    await assert.rejects(namedExports.readBoundedHtml({ body, headers: { get: () => '1' } }), /512 KiB/);
+    assert.equal(cancelled, true);
+    assert.equal(reads, 9);
+    assert.equal(body.locked, false);
+  });
+
+  await test('HTML limit: streaming decoder preserves split multibyte characters', async () => {
+    const bytes = new TextEncoder().encode('café');
+    const body = new ReadableStream({ start(controller) {
+      controller.enqueue(bytes.slice(0, 4));
+      controller.enqueue(bytes.slice(4));
+      controller.close();
+    } });
+    assert.equal(await namedExports.readBoundedHtml({ body }), 'café');
+    assert.equal(body.locked, false);
+  });
+
+  await test('HTML limit: search, resolution, and connection test reject oversized pages', async () => {
+    const host = createMockHost({ defaultHandler: () => ({
+      status: 200, text: 'x'.repeat(namedExports.MAX_HTML_BYTES + 1),
+      headers: { 'content-type': 'text/html' },
+    }) });
+    const config = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: '' } };
+    await assert.rejects(plugin.search({ title: 'Book' }, config, host), /512 KiB/);
+    await assert.rejects(plugin.resolveFile({ guid: 'a'.repeat(32), title: 'Book', format: 'epub' }, config, host), /512 KiB/);
+    const result = await plugin.test(config, host);
+    assert.equal(result.success, false);
+    assert.match(result.error, /512 KiB/);
   });
 
   await test('parseSize: invalid values, trailing garbage, negatives & infinite return null', () => {
@@ -1627,6 +1691,29 @@ async function runAllTests() {
   // 4. Download Resolution (resolveFile) Tests
   // =========================================================================
   suite('4. Download Resolution (resolveFile) Tests');
+
+  await test('resolveFile: rejects unsafe formats before fetching any target', async () => {
+    for (const format of ['epub/../../outside', 'epub\\..\\outside', 'epub\r\nsecret', '.epub', 'EPUB', 'exe', '', null, undefined, {}]) {
+      const host = createMockHost();
+      await assert.rejects(plugin.resolveFile({ guid: 'a'.repeat(32), title: 'Book', format }, defaultCfg, host), /Unsupported or malformed/);
+      assert.equal(host.calls.length, 0);
+    }
+  });
+
+  await test('resolveFile: all supported formats produce safe names on binary and HTML paths', async () => {
+    for (const format of namedExports.PREFERRED_EXTENSIONS) {
+      for (const binary of [true, false]) {
+        const host = createMockHost({ defaultHandler: () => ({ status: 200,
+          headers: { 'content-type': binary ? 'application/octet-stream' : 'text/html' },
+          text: '<a href="https://storage.example/book">GET</a>',
+        }) });
+        const file = await plugin.resolveFile({ guid: 'a'.repeat(32), title: '../Book\\Title', format }, defaultCfg, host);
+        assert.equal(file.format, format);
+        assert(file.fileName.endsWith(`.${format}`));
+        assert(!/[/\\\r\n]/.test(file.fileName));
+      }
+    }
+  });
 
   await test('resolveFile: rejects malformed GUID (not 32 hex chars)', async () => {
     const mockHost = createMockHost();

@@ -44,6 +44,7 @@ const MIN_ATTEMPTS = 1;
 const MAX_ATTEMPTS = 10;
 const DEFAULT_MIRROR_TIMEOUT_MS = 8000;
 const MD5_REGEX = /^[a-f0-9]{32}$/i;
+const MAX_HTML_BYTES = 512 * 1024;
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
@@ -506,7 +507,60 @@ function decodeHtmlEntities(text) {
  */
 function stripTags(html) {
   if (!html) return '';
-  return html.replace(/<[^>]*>/g, '');
+  const parts = [];
+  let offset = 0;
+  while (offset < html.length) {
+    const start = html.indexOf('<', offset);
+    if (start === -1) break;
+    const end = html.indexOf('>', start + 1);
+    if (end === -1) break;
+    parts.push(html.slice(offset, start));
+    offset = end + 1;
+  }
+  parts.push(html.slice(offset));
+  return parts.join('');
+}
+
+/** Bound parser input; streaming hosts also stop buffering at the byte limit. */
+async function readBoundedHtml(response) {
+  const tooLarge = () => new Error('Libgen HTML response exceeds the 512 KiB limit');
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_HTML_BYTES) {
+    discardResponse(response);
+    throw tooLarge();
+  }
+  if (typeof response.body?.getReader !== 'function') {
+    // Buffered-only hosts must enforce their own transport buffering limit.
+    const html = await response.text();
+    if (html.length > MAX_HTML_BYTES || new TextEncoder().encode(html).length > MAX_HTML_BYTES) {
+      throw tooLarge();
+    }
+    return html;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parts = [];
+  let size = 0;
+  let complete = false;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        complete = true;
+        break;
+      }
+      size += value.byteLength;
+      if (size > MAX_HTML_BYTES) throw tooLarge();
+      parts.push(decoder.decode(value, { stream: true }));
+    }
+    parts.push(decoder.decode());
+    return parts.join('');
+  } finally {
+    if (!complete) {
+      try { await reader.cancel(); } catch { /* Preserve the original failure. */ }
+    }
+    reader.releaseLock();
+  }
 }
 
 /**
@@ -812,7 +866,7 @@ async function search(query, config, host, signal) {
       }
 
       const responseUrl = validateHttpUrlString(response.url, searchUrl);
-      const html = await bounded.run(() => response.text());
+      const html = await bounded.run(() => readBoundedHtml(response));
 
       // Scoped empty-catalog detection: strictly within identified results containers
       const paginatorMatch = /<div\b[^>]*id=["']paginator["'][^>]*>([\s\S]*?)<\/div>/i.exec(html);
@@ -915,7 +969,11 @@ async function resolveFile(release, config, host, signal) {
 
   // 1. Strict MD5 validation
   if (!MD5_REGEX.test(md5)) {
-    throw fail(host, 'error', `Invalid release GUID "${release?.guid}": must be 32-character hex MD5`);
+    throw fail(host, 'error', 'Invalid release GUID: must be 32-character hex MD5');
+  }
+  const format = release?.format;
+  if (typeof format !== 'string' || !PREFERRED_EXTENSIONS.has(format)) {
+    throw fail(host, 'error', 'Unsupported or malformed Libgen file format');
   }
 
   // 2. Reconstruct candidate targets: validate scheme and exact MD5 identity before adding
@@ -970,23 +1028,23 @@ async function resolveFile(release, config, host, signal) {
         return {
           url: validateHttpUrl(responseUrl),
           headers: BROWSER_HEADERS, // Provided for host downloader
-          fileName: `${sanitizeName(release.bookTitle || release.title)}.${release.format}`,
+          fileName: `${sanitizeName(release.bookTitle || release.title)}.${format}`,
           sizeBytes: release.sizeBytes,
-          format: release.format,
+          format,
         };
       }
 
       // 4. Parse HTML landing page for exact GET download link
-      const html = await bounded.run(() => response.text());
+      const html = await bounded.run(() => readBoundedHtml(response));
       const directUrl = extractGetLink(html, responseUrl, md5);
 
       if (directUrl) {
         return {
           url: validateHttpUrl(directUrl),
           headers: BROWSER_HEADERS, // Provided for host downloader
-          fileName: `${sanitizeName(release.bookTitle || release.title)}.${release.format}`,
+          fileName: `${sanitizeName(release.bookTitle || release.title)}.${format}`,
           sizeBytes: release.sizeBytes,
-          format: release.format,
+          format,
         };
       }
 
@@ -1030,7 +1088,7 @@ async function test(config, host) {
       return { success: false, error: `Primary mirror returned HTTP ${response.status}` };
     }
 
-    const html = await response.text();
+    const html = await readBoundedHtml(response);
     const hasTable = /<table\b[^>]*\bid=["']tablelibgen["']/i.test(html);
     const hasSearchForm = /<form\b[^>]*action=["'][^"']*index\.php["'][^>]*>[\s\S]*?<input\b[^>]*name=["']req["']/i.test(html);
 
@@ -1106,6 +1164,8 @@ export {
   normalizeLanguage,
   decodeHtmlEntities,
   stripTags,
+  readBoundedHtml,
+  MAX_HTML_BYTES,
   parseSize,
   sanitizeName,
   parseSearchResults,
