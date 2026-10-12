@@ -43,6 +43,18 @@ const {
   hasConflictingOrDuplicateMd5,
   createBoundedRequestSignal,
   extractRowMd5,
+  WIRE_PAGE_SIZE,
+  DEFAULT_MAX_PAGES,
+  DEFAULT_SEARCH_BUDGET_MS,
+  MIN_SEARCH_BUDGET_MS,
+  MAX_SEARCH_BUDGET_MS,
+  MIN_PAGE_BUDGET_MS,
+  ISO_639_2_TO_1,
+  normalizeLanguageSubtag,
+  languagesAgree,
+  validateIsbn,
+  classifyQueryInputs,
+  SearchBudgetTracker,
 } = helpers;
 
 // Verify that critical helper functions were exported
@@ -1043,6 +1055,187 @@ async function runAllTests() {
   });
 
   // =========================================================================
+  // 1b. Unit Tests for Two-Pass Pagination & Budget Utilities
+  // =========================================================================
+  suite('1b. Unit Tests for Two-Pass Pagination & Budget Utilities');
+
+  await test('validateIsbn: syntax, modulo-11 ISBN-10, and alternating modulo-10 ISBN-13', () => {
+    // Valid ISBN-10 with numeric check digit
+    assert.deepEqual(validateIsbn('0-306-40615-2'), { valid: true, clean: '0306406152', type: 'isbn10' });
+    // Valid ISBN-10 with check digit 'X'
+    assert.deepEqual(validateIsbn('0-8044-2957-X'), { valid: true, clean: '080442957X', type: 'isbn10' });
+    assert.deepEqual(validateIsbn('080442957x'), { valid: true, clean: '080442957X', type: 'isbn10' });
+    // Invalid ISBN-10 check digit
+    assert.deepEqual(validateIsbn('0-306-40615-3'), { valid: false, clean: '', type: null });
+
+    // Valid ISBN-13 (prefix 978)
+    assert.deepEqual(validateIsbn('978-0-306-40615-7'), { valid: true, clean: '9780306406157', type: 'isbn13' });
+    // Valid ISBN-13 (prefix 979)
+    assert.deepEqual(validateIsbn('979-10-90636-07-1'), { valid: true, clean: '9791090636071', type: 'isbn13' });
+    // Invalid ISBN-13 check digit
+    assert.deepEqual(validateIsbn('978-0-306-40615-8'), { valid: false, clean: '', type: null });
+
+    // Non-string / null / empty / malformed
+    assert.deepEqual(validateIsbn(null), { valid: false, clean: '', type: null });
+    assert.deepEqual(validateIsbn(''), { valid: false, clean: '', type: null });
+    assert.deepEqual(validateIsbn('12345'), { valid: false, clean: '', type: null });
+    assert.deepEqual(validateIsbn('978-invalid-isbn'), { valid: false, clean: '', type: null });
+  });
+
+  await test('classifyQueryInputs: bare ISBN vs host echo vs hybrid vs text-only', () => {
+    // Bare ISBN-10 string
+    const bare10 = classifyQueryInputs('0-306-40615-2', null);
+    assert.equal(bare10.isIsbnOnly, true);
+    assert.equal(bare10.hasMeaningfulText, false);
+    assert.equal(bare10.searchText, '');
+    assert.equal(bare10.isbnVal.clean, '0306406152');
+
+    // Bare ISBN-13 string
+    const bare13 = classifyQueryInputs('9780306406157', null);
+    assert.equal(bare13.isIsbnOnly, true);
+    assert.equal(bare13.hasMeaningfulText, false);
+    assert.equal(bare13.searchText, '');
+
+    // Host-echoed ISBN matching candidate text
+    const hostEcho = classifyQueryInputs(
+      { isbn13: '9780306406157' },
+      { buildSearchText: () => '978-0-306-40615-7' }
+    );
+    assert.equal(hostEcho.isIsbnOnly, true);
+    assert.equal(hostEcho.hasMeaningfulText, false);
+    assert.equal(hostEcho.searchText, '');
+
+    // Hybrid query: valid ISBN with genuine title text
+    const hybrid = classifyQueryInputs(
+      { isbn13: '9780306406157', title: 'Dune' },
+      { buildSearchText: () => 'Dune' }
+    );
+    assert.equal(hybrid.isIsbnOnly, false);
+    assert.equal(hybrid.hasMeaningfulText, true);
+    assert.equal(hybrid.searchText, 'Dune');
+
+    // Text-only query
+    const textOnly = classifyQueryInputs('Dune Frank Herbert', null);
+    assert.equal(textOnly.isbnVal.valid, false);
+    assert.equal(textOnly.isIsbnOnly, false);
+    assert.equal(textOnly.hasMeaningfulText, true);
+    assert.equal(textOnly.searchText, 'Dune Frank Herbert');
+
+    // Empty query
+    const empty = classifyQueryInputs('', null);
+    assert.equal(empty.isIsbnOnly, false);
+    assert.equal(empty.hasMeaningfulText, false);
+  });
+
+  await test('buildSearchUrl: wire page size, options object, column selection, and page param', () => {
+    const base = 'https://libgen.bz';
+    // Legacy numeric limit (res=15, full columns & objects, no page)
+    const u1 = new URL(buildSearchUrl(base, 'dune', 15));
+    assert.equal(u1.searchParams.get('res'), '15');
+    assert.deepEqual(u1.searchParams.getAll('columns[]'), ['t', 'a', 's', 'y', 'p', 'i']);
+    assert.deepEqual(u1.searchParams.getAll('objects[]'), ['f', 'e', 's', 'a', 'p', 'w']);
+    assert.equal(u1.searchParams.has('page'), false);
+
+    // Default limit uses WIRE_PAGE_SIZE = 25
+    const uDefault = new URL(buildSearchUrl(base, 'dune'));
+    assert.equal(uDefault.searchParams.get('res'), '25');
+
+    // Options with columns=['i'] (ISBN targeted pass) defaults objects to ['f']
+    const uIsbn = new URL(buildSearchUrl(base, '9780306406157', { columns: ['i'] }));
+    assert.deepEqual(uIsbn.searchParams.getAll('columns[]'), ['i']);
+    assert.deepEqual(uIsbn.searchParams.getAll('objects[]'), ['f']);
+    assert.equal(uIsbn.searchParams.get('res'), '25');
+
+    // Options with page=1 omits page parameter
+    const uPage1 = new URL(buildSearchUrl(base, 'dune', { page: 1 }));
+    assert.equal(uPage1.searchParams.has('page'), false);
+
+    // Options with page=3 sets page parameter
+    const uPage3 = new URL(buildSearchUrl(base, 'dune', { columns: ['t', 'a'], page: 3 }));
+    assert.deepEqual(uPage3.searchParams.getAll('columns[]'), ['t', 'a']);
+    assert.equal(uPage3.searchParams.get('page'), '3');
+  });
+
+  await test('languagesAgree & normalizeLanguageSubtag: 2-letter, 3-letter, dialects, and mismatches', () => {
+    // Exact 2-letter matches
+    assert.equal(languagesAgree('en', 'en'), true);
+    assert.equal(languagesAgree('es', 'es'), true);
+
+    // 3-letter to 2-letter mapping via ISO_639_2_TO_1
+    assert.equal(normalizeLanguageSubtag('eng'), 'en');
+    assert.equal(normalizeLanguageSubtag('fre'), 'fr');
+    assert.equal(normalizeLanguageSubtag('spa'), 'es');
+    assert.equal(languagesAgree('eng', 'en'), true);
+    assert.equal(languagesAgree('en', 'eng'), true);
+
+    // Subtag dialects
+    assert.equal(normalizeLanguageSubtag('en-US'), 'en');
+    assert.equal(normalizeLanguageSubtag('pt_BR'), 'pt');
+    assert.equal(languagesAgree('en-US', 'en'), true);
+
+    // Permissive missing metadata
+    assert.equal(languagesAgree(undefined, 'en'), true);
+    assert.equal(languagesAgree('en', undefined), true);
+    assert.equal(languagesAgree(null, null), true);
+
+    // Rejection of language mismatches
+    assert.equal(languagesAgree('en', 'es'), false);
+    assert.equal(languagesAgree('de', 'fr'), false);
+  });
+
+  await test('SearchBudgetTracker: deterministic clock injection, bounds clamping, and page prediction', () => {
+    // Clamping bounds
+    const lowTracker = new SearchBudgetTracker(500);
+    assert.equal(lowTracker.budgetMs, 1000);
+    const highTracker = new SearchBudgetTracker(25000);
+    assert.equal(highTracker.budgetMs, 18000);
+    const defaultTracker = new SearchBudgetTracker();
+    assert.equal(defaultTracker.budgetMs, 15000);
+
+    // Mock clock injection
+    let mockTime = 10000;
+    const tracker = new SearchBudgetTracker(5000, null, () => mockTime);
+    assert.equal(tracker.remainingMs(), 5000);
+    assert.equal(tracker.isExhausted(), false);
+    assert.equal(tracker.canAffordNextPage(), true);
+
+    // Advance clock by 3000ms
+    mockTime += 3000;
+    assert.equal(tracker.remainingMs(), 2000);
+    assert.equal(tracker.isExhausted(), false);
+
+    // Record page duration of 2200ms -> slowestPageMs = 2200
+    tracker.recordPageDuration(2200);
+    assert.equal(tracker.slowestPageMs, 2200);
+    // Remaining is 2000 < slowestPageMs (2200) -> canAffordNextPage() returns false
+    assert.equal(tracker.canAffordNextPage(), false);
+
+    // Prediction against MIN_PAGE_BUDGET_MS: remaining <= MIN_PAGE_BUDGET_MS cannot afford next page
+    assert.equal(MIN_PAGE_BUDGET_MS, 500);
+    let minClock = 0;
+    const minTracker = new SearchBudgetTracker(1000, null, () => minClock);
+    assert.equal(minTracker.canAffordNextPage(), true);
+    minClock = 500; // remaining is 500 <= MIN_PAGE_BUDGET_MS (500)
+    assert.equal(minTracker.remainingMs(), 500);
+    assert.equal(minTracker.canAffordNextPage(), false);
+
+    // Clock reaches budget
+    mockTime += 2000;
+    assert.equal(tracker.remainingMs(), 0);
+    assert.equal(tracker.isExhausted(), true);
+    assert.equal(tracker.canAffordNextPage(), false);
+
+    // Host signal abort sets remainingMs to 0
+    const controller = new AbortController();
+    const abortTracker = new SearchBudgetTracker(10000, controller.signal);
+    assert.equal(abortTracker.canAffordNextPage(), true);
+    controller.abort();
+    assert.equal(abortTracker.remainingMs(), 0);
+    assert.equal(abortTracker.isExhausted(), true);
+    assert.equal(abortTracker.canAffordNextPage(), false);
+  });
+
+  // =========================================================================
   // 2. Fixture-driven Search Tests
   // =========================================================================
   suite('2. Fixture-driven Search Tests');
@@ -1142,25 +1335,16 @@ async function runAllTests() {
     assert.equal(releases[2].language, 'fr');
   });
 
-  await test('Fixture: search-unsupported-formats.html (fails over to next mirror)', async () => {
+  await test('Fixture: unsupported formats are terminal without mirror failover', async () => {
     const mockHost = createMockHost({
       routes: [
-        {
-          pattern: 'https://libgen.bz',
-          handler: { fixture: 'search-unsupported-formats.html', status: 200 },
-        },
-        {
-          pattern: 'https://libgen.li',
-          handler: { fixture: 'search-covers-on.html', status: 200 },
-        },
+        { pattern: 'https://libgen.bz', handler: { fixture: 'search-unsupported-formats.html', status: 200 } },
+        { pattern: 'https://libgen.li', handler: { status: 500, ok: false } },
       ],
     });
-
     const releases = await plugin.search({ title: 'Dune' }, defaultCfg, mockHost);
-    // Mirror 1 had only rar/cbr -> failover to mirror 2 -> returns valid epub
-    assert.equal(releases.length, 2);
-    assert.equal(releases[0].format, 'epub');
-    assert.equal(mockHost.calls.length, 2);
+    assert.deepEqual(releases, []);
+    assert.equal(mockHost.calls.length, 1);
   });
 
   await test('Fixture: search-parser-rejection.html (fails over to next mirror, does NOT return [] on single broken mirror)', async () => {
@@ -1182,7 +1366,7 @@ async function runAllTests() {
     assert.equal(releases[0].title, 'Dune');
     assert.equal(mockHost.calls.length, 2);
 
-    // If only one mirror configured and it has parser rejection -> throws 'unreachable', NOT []!
+    // If only one mirror configured and it has parser rejection -> throws 'parser_error', NOT []!
     const singleMirrorCfg = { baseUrl: 'https://libgen.bz' };
     const singleHost = createMockHost({
       routes: [
@@ -1195,7 +1379,7 @@ async function runAllTests() {
 
     await assert.rejects(
       async () => await plugin.search({ title: 'Dune' }, singleMirrorCfg, singleHost),
-      (err) => err?.kind === 'unreachable'
+      (err) => err?.kind === 'parser_error'
     );
   });
 
@@ -1413,6 +1597,619 @@ async function runAllTests() {
   });
 
   // =========================================================================
+  // 2b. Multi-Page Pagination & Two-Pass Orchestration Tests
+  // =========================================================================
+  suite('2b. Multi-Page Pagination & Two-Pass Orchestration Tests');
+
+  function makeLibgenPageHtml(rows, paginatorHtml = '') {
+    const trs = rows.map(r => `
+      <tr>
+        <td class="cover"><img src="/covers/c_${r.md5}.jpg" alt="cover"></td>
+        <td><a href="/book/index.php?md5=${r.md5}">${r.title}</a></td>
+        <td>${r.author || 'Author'}</td>
+        <td>Publisher</td>
+        <td>2020</td>
+        <td>${r.language || 'English'}</td>
+        <td>300</td>
+        <td>${r.size || '1.0 MB'}</td>
+        <td>${r.format || 'epub'}</td>
+        <td><a href="ads.php?md5=${r.md5}">[1]</a></td>
+      </tr>
+    `).join('\n');
+    return `<table id="tablelibgen"><tbody>${trs}</tbody></table>${paginatorHtml}`;
+  }
+
+  await test('Pagination: Unrecognized HTML failover across mirrors', async () => {
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: '<html><body>Cloudflare Challenge</body></html>', status: 200 },
+        },
+        {
+          pattern: 'https://libgen.li',
+          handler: { fixture: 'search-covers-on.html', status: 200 },
+        },
+      ],
+    });
+    const releases = await plugin.search({ title: 'Dune' }, defaultCfg, mockHost);
+    assert.equal(releases.length, 2);
+    assert.equal(mockHost.calls.length, 2);
+  });
+
+  await test('Pagination: Precedence of valid items over contradictory empty text across pages', async () => {
+    // Page 1 has 25 Russian rows with contradictory "no books found" in paginator
+    const page1Rows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `111111111111111111111111111111${String(i).padStart(2, '0')}`,
+      title: `Russian Title ${i}`,
+      language: 'Russian',
+      format: 'epub',
+    }));
+    const page1Html = makeLibgenPageHtml(page1Rows, '<div id="paginator">no books found</div>');
+
+    // Page 2 has 3 English rows
+    const page2Rows = [
+      { md5: '22222222222222222222222222222201', title: 'English Title 1', language: 'English', format: 'epub' },
+      { md5: '22222222222222222222222222222202', title: 'English Title 2', language: 'English', format: 'epub' },
+      { md5: '22222222222222222222222222222203', title: 'English Title 3', language: 'English', format: 'epub' },
+    ];
+    const page2Html = makeLibgenPageHtml(page2Rows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('page=2'),
+          handler: { text: page2Html, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: page1Html, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { maxPages: 4 } };
+    const releases = await plugin.search({ title: 'Dune', language: 'en' }, cfg, mockHost);
+    assert.equal(releases.length, 3);
+    assert.equal(releases[0].title, 'English Title 1');
+    assert.equal(mockHost.calls.length, 2);
+  });
+
+  await test('Pagination: Full page without paginator markup continues walking', async () => {
+    const page1Rows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `333333333333333333333333333333${String(i).padStart(2, '0')}`,
+      title: `Page 1 Book ${i}`,
+      language: 'English',
+      format: 'epub',
+    }));
+    const page1Html = makeLibgenPageHtml(page1Rows); // completely no paginator markup
+
+    const page2Rows = [
+      { md5: '44444444444444444444444444444401', title: 'Page 2 Book 1', language: 'English', format: 'epub' },
+    ];
+    const page2Html = makeLibgenPageHtml(page2Rows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('page=2'),
+          handler: { text: page2Html, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: page1Html, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { maxPages: 2 } };
+    const releases = await plugin.search({ title: 'Dune', limit: 30 }, cfg, mockHost);
+    assert.equal(releases.length, 26);
+    assert.equal(mockHost.calls.length, 2);
+  });
+
+  await test('Budget: completed empty and filtered searches do not need another page budget', async () => {
+    for (const fixture of ['empty-search.html', 'search-unsupported-formats.html']) {
+      for (const elapsed of [8000, 15000]) {
+        let now = 0;
+        const host = createMockHost({
+          defaultHandler: () => {
+            now = elapsed;
+            return { fixture, status: 200 };
+          },
+        });
+        const cfg = {
+          baseUrl: 'https://libgen.bz',
+          settings: { fallbackMirrors: '', maxPages: 1, searchBudgetMs: 15000 },
+          _nowFn: () => now,
+        };
+        assert.deepEqual(await plugin.search({ title: 'Dune' }, cfg, host), []);
+        assert.equal(host.calls.length, 1);
+      }
+    }
+  });
+
+  await test('Budget: preemption before a required mirror retry throws timeout', async () => {
+    let now = 0;
+    const host = createMockHost({ defaultHandler: () => {
+      now = 15000;
+      return { status: 500, ok: false };
+    } });
+    const cfg = {
+      baseUrl: 'https://libgen.bz',
+      settings: { fallbackMirrors: 'https://libgen.li', searchBudgetMs: 15000 },
+      _nowFn: () => now,
+    };
+    await assert.rejects(plugin.search({ title: 'Dune' }, cfg, host), err => err?.kind === 'timeout');
+    assert.equal(host.calls.length, 1);
+  });
+
+  await test('Two-Pass: empty ISBN pass is not retried after text failure', async () => {
+    const host = createMockHost({ defaultHandler: url => {
+      const parsed = new URL(url);
+      const isbn = parsed.searchParams.getAll('columns[]').includes('i');
+      if (parsed.hostname === 'libgen.bz') {
+        return isbn
+          ? { fixture: 'empty-search.html', status: 200 }
+          : { status: 500, ok: false };
+      }
+      assert.equal(isbn, false, 'Completed ISBN pass must not run on the fallback');
+      return { fixture: 'search-covers-on.html', status: 200 };
+    } });
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: 'https://libgen.li' } };
+    const releases = await plugin.search({ isbn13: '9780306406157', title: 'Dune', limit: 10 }, cfg, host);
+    assert.equal(releases.length, 2);
+    assert.equal(host.calls.length, 3);
+  });
+
+  await test('Error Classification: all parser failures retain parser_error, mixed failures remain unreachable', async () => {
+    for (const mixed of [false, true]) {
+      const host = createMockHost({ defaultHandler: url => {
+        if (mixed && new URL(url).hostname === 'libgen.li') return { status: 500, ok: false };
+        return { fixture: 'search-parser-rejection.html', status: 200 };
+      } });
+      const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: 'https://libgen.li' } };
+      await assert.rejects(plugin.search({ title: 'Dune' }, cfg, host), err => err?.kind === (mixed ? 'unreachable' : 'parser_error'));
+      assert.equal(host.calls.length, 2);
+    }
+  });
+
+  await test('Two-Pass: Terminal clean pass completion does NOT retry Mirror 2', async () => {
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: 'https://libgen.bz',
+          handler: { fixture: 'search-covers-on.html', status: 200 },
+        },
+        {
+          pattern: 'https://libgen.li',
+          handler: { fixture: 'search-covers-off.html', status: 200 },
+        },
+      ],
+    });
+
+    const cfg = {
+      baseUrl: 'https://libgen.bz',
+      settings: { fallbackMirrors: 'https://libgen.li' },
+    };
+
+    // Mirror 1 completes with 2 releases (limit 10 requested)
+    const releases = await plugin.search({ title: 'Dune', limit: 10 }, cfg, mockHost);
+    assert.equal(releases.length, 2);
+    // Must NOT have queried Mirror 2
+    assert.equal(mockHost.calls.length, 1);
+  });
+
+  await test('Two-Pass: Terminal unsupported-only completion does NOT retry Mirror 2', async () => {
+    // 4 pages of Russian books
+    const russianRows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `555555555555555555555555555555${String(i).padStart(2, '0')}`,
+      title: `Russian Book ${i}`,
+      language: 'Russian',
+      format: 'epub',
+    }));
+    const pageHtml = makeLibgenPageHtml(russianRows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: pageHtml, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.li',
+          handler: { status: 500, ok: false },
+        },
+      ],
+    });
+
+    const cfg = {
+      baseUrl: 'https://libgen.bz',
+      settings: { fallbackMirrors: 'https://libgen.li', maxPages: 4 },
+    };
+
+    const releases = await plugin.search({ title: 'Dune', language: 'en' }, cfg, mockHost);
+    assert.deepEqual(releases, []);
+    // Must have walked 4 pages on Mirror 1 and NOT called Mirror 2
+    assert.equal(mockHost.calls.length, 4);
+    assert(mockHost.calls.every(c => c.url.startsWith('https://libgen.bz')));
+  });
+
+  await test('Mixed Status: ISBN empty + text unsupported-only cleanly returns []', async () => {
+    // Pass 1: ISBN returns empty table
+    const emptyHtml = makeLibgenPageHtml([], '<div id="paginator">no books found</div>');
+    // Pass 2: 4 pages of Russian
+    const russianRows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `666666666666666666666666666666${String(i).padStart(2, '0')}`,
+      title: `Russian Edition ${i}`,
+      language: 'Russian',
+      format: 'epub',
+    }));
+    const russianHtml = makeLibgenPageHtml(russianRows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('columns%5B%5D=i'),
+          handler: { text: emptyHtml, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: russianHtml, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { maxPages: 2 } };
+    const query = { isbn13: '9780306406157', title: 'Dune', language: 'en' };
+    const releases = await plugin.search(query, cfg, mockHost);
+    assert.deepEqual(releases, []);
+  });
+
+  await test('Mixed Status: ISBN empty + text pass failure throws structured unreachable', async () => {
+    const emptyHtml = makeLibgenPageHtml([], '<div id="paginator">no books found</div>');
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('columns%5B%5D=i'),
+          handler: { text: emptyHtml, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { status: 500, ok: false, text: 'Server Error' },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: '' } };
+    const query = { isbn13: '9780306406157', title: 'Dune' };
+    await assert.rejects(
+      async () => await plugin.search(query, cfg, mockHost),
+      (err) => {
+        assert.equal(err?.kind, 'unreachable');
+        return true;
+      }
+    );
+  });
+
+  await test('Two-Pass: Hybrid query where all mirrors fail ISBN pass throws structured error', async () => {
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: /https:\/\/libgen\./,
+          handler: { status: 500, ok: false, text: 'Server Error' },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: 'https://libgen.li' } };
+    const query = { isbn13: '9780306406157', title: 'Dune' };
+    await assert.rejects(
+      async () => await plugin.search(query, cfg, mockHost),
+      (err) => {
+        assert.equal(err?.kind, 'unreachable');
+        return true;
+      }
+    );
+  });
+
+  await test('Error Classification: Network socket failure vs HTTP 500 vs 429 vs 504', async () => {
+    // 1. Network error
+    const netHost = { fetch: async () => { throw new Error('fetch failed'); } };
+    await assert.rejects(
+      plugin.search({ title: 'Dune' }, defaultCfg, netHost),
+      err => err.kind === 'unreachable'
+    );
+
+    // 2. HTTP 500
+    const err500Host = createMockHost({ defaultHandler: () => ({ status: 500, ok: false }) });
+    await assert.rejects(
+      plugin.search({ title: 'Dune' }, defaultCfg, err500Host),
+      err => err.kind === 'unreachable' && err.message.includes('500')
+    );
+
+    // 3. HTTP 429 Throttled
+    const err429Host = createMockHost({ defaultHandler: () => ({ status: 429, ok: false }) });
+    await assert.rejects(
+      plugin.search({ title: 'Dune' }, defaultCfg, err429Host),
+      err => err.kind === 'throttled'
+    );
+
+    // 4. HTTP 504 Timeout
+    const err504Host = createMockHost({ defaultHandler: () => ({ status: 504, ok: false }) });
+    await assert.rejects(
+      plugin.search({ title: 'Dune' }, defaultCfg, err504Host),
+      err => err.kind === 'timeout'
+    );
+  });
+
+  await test('Budget: Post-fetch budget preemption with zero candidates throws timeout', async () => {
+    // Page 1 has 25 Russian rows (all rejected)
+    const russianRows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `777777777777777777777777777777${String(i).padStart(2, '0')}`,
+      title: `Russian Title ${i}`,
+      language: 'Russian',
+      format: 'epub',
+    }));
+    const page1Html = makeLibgenPageHtml(russianRows);
+
+    let currentTime = 1000;
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: 'https://libgen.bz',
+          handler: () => {
+            // Advance clock past budget ceiling during fetch
+            currentTime += 16000;
+            return { text: page1Html, status: 200 };
+          },
+        },
+      ],
+    });
+
+    const cfg = {
+      baseUrl: 'https://libgen.bz',
+      settings: { searchBudgetMs: 15000, maxPages: 4 },
+      _nowFn: () => currentTime,
+    };
+
+    await assert.rejects(
+      async () => await plugin.search({ title: 'Dune', language: 'en' }, cfg, mockHost),
+      (err) => {
+        assert.equal(err?.kind, 'timeout');
+        return true;
+      }
+    );
+  });
+
+  await test('Budget: Pre-fetch budget preemption with zero candidates throws timeout', async () => {
+    let calls = 0;
+    const mockHost = { fetch: async () => { calls++; return { ok: true }; } };
+    let clock = 1000;
+    const cfg = {
+      baseUrl: 'https://libgen.bz',
+      settings: { searchBudgetMs: 5000 },
+      _nowFn: () => {
+        const val = clock;
+        clock += 6000;
+        return val;
+      },
+    };
+
+    await assert.rejects(
+      async () => await plugin.search({ title: 'Dune' }, cfg, mockHost),
+      (err) => {
+        assert.equal(err?.kind, 'timeout');
+        return true;
+      }
+    );
+    assert.equal(calls, 0);
+  });
+
+  await test('Pagination: Later-page failure with zero candidates retains error', async () => {
+    const russianRows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `888888888888888888888888888888${String(i).padStart(2, '0')}`,
+      title: `Russian Book ${i}`,
+      language: 'Russian',
+      format: 'epub',
+    }));
+    const page1Html = makeLibgenPageHtml(russianRows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('page=2'),
+          handler: { status: 500, ok: false, text: 'Internal Server Error' },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: page1Html, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: '', maxPages: 3 } };
+    await assert.rejects(
+      async () => await plugin.search({ title: 'Dune', language: 'en' }, cfg, mockHost),
+      (err) => {
+        assert.equal(err?.kind, 'unreachable');
+        return true;
+      }
+    );
+  });
+
+  await test('Pagination: Later-page failure with existing candidates returns partial results', async () => {
+    const page1Rows = [
+      { md5: '99999999999999999999999999999901', title: 'English Candidate 1', language: 'English', format: 'epub' },
+      { md5: '99999999999999999999999999999902', title: 'English Candidate 2', language: 'English', format: 'epub' },
+      ...Array.from({ length: 23 }, (_, i) => ({
+        md5: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa${String(i).padStart(2, '0')}`,
+        title: `Russian Book ${i}`,
+        language: 'Russian',
+        format: 'epub',
+      })),
+    ];
+    assert.equal(page1Rows.length, 25);
+    const page1Html = makeLibgenPageHtml(page1Rows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('page=2'),
+          handler: { status: 500, ok: false, text: 'Internal Server Error' },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: page1Html, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { maxPages: 3 } };
+    const releases = await plugin.search({ title: 'Dune', language: 'en' }, cfg, mockHost);
+    assert.equal(releases.length, 2);
+    assert.equal(releases[0].title, 'English Candidate 1');
+    assert.equal(releases[1].title, 'English Candidate 2');
+  });
+
+  await test('Two-Pass: Full workflow with deduplication across passes', async () => {
+    // Pass 1 ISBN hits: 2 items (GUIDs 111... and 222...)
+    const isbnRows = [
+      { md5: '11111111111111111111111111111111', title: 'Dune (ISBN Match 1)', language: 'English', format: 'epub' },
+      { md5: '22222222222222222222222222222222', title: 'Dune (ISBN Match 2)', language: 'English', format: 'epub' },
+    ];
+    const isbnHtml = makeLibgenPageHtml(isbnRows);
+
+    // Pass 2 Text hits: 5 items (one duplicate 111..., four new: 333..., 444..., 555..., 666...)
+    const textRows = [
+      { md5: '11111111111111111111111111111111', title: 'Dune (Duplicate)', language: 'English', format: 'epub' },
+      { md5: '33333333333333333333333333333333', title: 'Dune (Text Match 1)', language: 'English', format: 'epub' },
+      { md5: '44444444444444444444444444444444', title: 'Dune (Text Match 2)', language: 'English', format: 'epub' },
+      { md5: '55555555555555555555555555555555', title: 'Dune (Text Match 3)', language: 'English', format: 'epub' },
+      { md5: '66666666666666666666666666666666', title: 'Dune (Text Match 4)', language: 'English', format: 'epub' },
+    ];
+    const textHtml = makeLibgenPageHtml(textRows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('columns%5B%5D=i'),
+          handler: { text: isbnHtml, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: textHtml, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz' };
+    const query = { isbn13: '9780306406157', title: 'Dune', limit: 5 };
+    const releases = await plugin.search(query, cfg, mockHost);
+
+    // Limit 5 requested: 2 from Pass 1 lead, followed by 3 unique from Pass 2
+    assert.equal(releases.length, 5);
+    assert.equal(releases[0].guid, '11111111111111111111111111111111');
+    assert.equal(releases[1].guid, '22222222222222222222222222222222');
+    assert.equal(releases[2].guid, '33333333333333333333333333333333');
+    assert.equal(releases[3].guid, '44444444444444444444444444444444');
+    assert.equal(releases[4].guid, '55555555555555555555555555555555');
+  });
+
+  await test('Two-Pass: ISBN-only bare string skips text pass', async () => {
+    const isbnRows = [
+      { md5: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01', title: 'ISBN Novel', language: 'English', format: 'epub' },
+    ];
+    const isbnHtml = makeLibgenPageHtml(isbnRows);
+
+    let textPassCalled = false;
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('columns%5B%5D=i'),
+          handler: { text: isbnHtml, status: 200 },
+        },
+        {
+          pattern: (url) => url.includes('columns%5B%5D=t'),
+          handler: () => {
+            textPassCalled = true;
+            return { text: '', status: 200 };
+          },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz' };
+    const releases = await plugin.search('9780306406157', cfg, mockHost);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].guid, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01');
+    assert.equal(textPassCalled, false, 'Text pass must NOT be called for bare ISBN query');
+  });
+
+  await test('Two-Pass: Cross-pass resilience preserves Pass 1 hits when Pass 2 fails', async () => {
+    const isbnRows = [
+      { md5: 'cccccccccccccccccccccccccccccc01', title: 'ISBN Edition 1', language: 'English', format: 'epub' },
+      { md5: 'cccccccccccccccccccccccccccccc02', title: 'ISBN Edition 2', language: 'English', format: 'epub' },
+    ];
+    const isbnHtml = makeLibgenPageHtml(isbnRows);
+
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('columns%5B%5D=i'),
+          handler: { text: isbnHtml, status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { status: 500, ok: false },
+        },
+        {
+          pattern: 'https://libgen.li',
+          handler: { status: 500, ok: false },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: 'https://libgen.li' } };
+    const query = { isbn13: '9780306406157', title: 'Dune', limit: 10 };
+    const releases = await plugin.search(query, cfg, mockHost);
+    assert.equal(releases.length, 2);
+    assert.equal(releases[0].guid, 'cccccccccccccccccccccccccccccc01');
+    assert.equal(releases[1].guid, 'cccccccccccccccccccccccccccccc02');
+  });
+
+  await test('Cancellation: Caller cancellation is terminal and returns []', async () => {
+    const page1Rows = Array.from({ length: 25 }, (_, i) => ({
+      md5: `dddddddddddddddddddddddddddddd${String(i).padStart(2, '0')}`,
+      title: `Book ${i}`,
+      language: 'English',
+      format: 'epub',
+    }));
+    const page1Html = makeLibgenPageHtml(page1Rows);
+
+    const controller = new AbortController();
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('page=2'),
+          handler: () => {
+            controller.abort();
+            return { text: '', status: 200 };
+          },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { text: page1Html, status: 200 },
+        },
+      ],
+    });
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { maxPages: 4 } };
+    const releases = await plugin.search({ title: 'Dune', limit: 50 }, cfg, mockHost, controller.signal);
+    assert.deepEqual(releases, [], 'Caller cancellation must return [] immediately without partial leakage');
+  });
+
+  // =========================================================================
   // 3. Multi-mirror Failover Tests
   // =========================================================================
   suite('3. Multi-mirror Failover Tests');
@@ -1618,23 +2415,16 @@ async function runAllTests() {
     );
   });
 
-  await test('Failover: Mirror 1 empty -> fails over to Mirror 2', async () => {
+  await test('Verified empty search is terminal without mirror failover', async () => {
     const mockHost = createMockHost({
       routes: [
-        {
-          pattern: 'https://libgen.bz',
-          handler: { fixture: 'empty-search.html', status: 200 },
-        },
-        {
-          pattern: 'https://libgen.li',
-          handler: { fixture: 'search-covers-on.html', status: 200 },
-        },
+        { pattern: 'https://libgen.bz', handler: { fixture: 'empty-search.html', status: 200 } },
+        { pattern: 'https://libgen.li', handler: { status: 500, ok: false } },
       ],
     });
-
     const releases = await plugin.search({ title: 'Dune' }, defaultCfg, mockHost);
-    assert.equal(releases.length, 2);
-    assert.equal(mockHost.calls.length, 2);
+    assert.deepEqual(releases, []);
+    assert.equal(mockHost.calls.length, 1);
   });
 
   await test('Failover: request-local timeout (AbortError) on Mirror 1 fails over to Mirror 2', async () => {

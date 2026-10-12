@@ -14,12 +14,14 @@ No credentials or extra dependencies required. Supports BookOrbit plugin API v1.
 
 ## Settings
 
-| Setting | Default |
-| --- | --- |
-| Base URL (`baseUrl`) | `https://libgen.bz` |
-| Fallback mirrors (`settings.fallbackMirrors`) | `https://libgen.li, https://libgen.la, https://libgen.gl` |
-| Maximum mirror attempts (`settings.maxMirrorAttempts`) | `3`, including the primary |
-| Per-attempt timeout (`settings.timeoutMs`) | `8000` milliseconds |
+| Setting | Default | Range / Description |
+| --- | --- | --- |
+| Base URL (`baseUrl`) | `https://libgen.bz` | Mirror origin |
+| Fallback mirrors (`settings.fallbackMirrors`) | `https://libgen.li, https://libgen.la, https://libgen.gl` | Comma-separated fallback mirrors |
+| Maximum mirror attempts (`settings.maxMirrorAttempts`) | `3` | Attempts including primary (1–10) |
+| Per-attempt timeout (`settings.timeoutMs`) | `8000` | Per-request timeout in milliseconds |
+| Maximum search pages (`settings.maxPages`) | `4` | Maximum pagination depth per pass (1–10) |
+| Search deadline budget (`settings.searchBudgetMs`) | `15000` | Total deadline budget across all pages (1000–18000 ms; preserves buffer before host 20s ceiling) |
 
 Use mirrors with the `libgen.li` / `libgen.bz` layout; `libgen.rs` / `libgen.is`
 layouts aren't supported. Mirrors are tried in order. The default limit tries

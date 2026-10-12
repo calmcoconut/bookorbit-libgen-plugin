@@ -45,6 +45,12 @@ const MAX_ATTEMPTS = 10;
 const DEFAULT_MIRROR_TIMEOUT_MS = 8000;
 const MD5_REGEX = /^[a-f0-9]{32}$/i;
 const MAX_HTML_BYTES = 512 * 1024;
+const WIRE_PAGE_SIZE = 25;
+const DEFAULT_MAX_PAGES = 4;
+const DEFAULT_SEARCH_BUDGET_MS = 15000;
+const MIN_SEARCH_BUDGET_MS = 1000;
+const MAX_SEARCH_BUDGET_MS = 18000;
+const MIN_PAGE_BUDGET_MS = 500;
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
@@ -86,6 +92,7 @@ function fail(host, code, message) {
   }
   const err = new Error(message);
   err.code = code;
+  err.kind = code;
   return err;
 }
 
@@ -446,33 +453,193 @@ function clampLimit(rawLimit) {
 }
 
 /**
- * Builds the search URL targeting /index.php on baseUrl with standard columns, objects, and topics.
+ * Constructs search URL targeting /index.php on baseUrl.
+ * Supports legacy signature (baseUrl, searchText, limit) for backwards compatibility
+ * and structured options for modern two-pass pagination.
+ *
+ * @param {string} baseUrl - Validated mirror origin (e.g. 'https://libgen.bz')
+ * @param {string} searchText - Query text or clean ISBN
+ * @param {object|number} [optionsOrLimit=25]
+ * @param {number} [optionsOrLimit.limit=25] - Requested wire page size (res parameter)
+ * @param {number} [optionsOrLimit.page=1] - 1-indexed page number (omitted if page === 1)
+ * @param {string[]} [optionsOrLimit.columns] - Column codes: ['i'] for ISBN, ['t', 'a'] for text
+ * @param {string[]} [optionsOrLimit.objects] - Object types: default ['f'] (files)
+ * @param {string[]} [optionsOrLimit.topics] - Topic codes: default ['l', 'f']
+ * @returns {string} Fully formed search URL
  */
-function buildSearchUrl(baseUrl, searchText, limit = 25) {
+function buildSearchUrl(baseUrl, searchText, optionsOrLimit = 25) {
   const url = new URL('/index.php', baseUrl);
   const params = new URLSearchParams();
 
   params.set('req', searchText);
 
-  // Columns: title (t), author (a), series (s), year (y), publisher (p), isbn (i)
-  for (const col of ['t', 'a', 's', 'y', 'p', 'i']) {
-    params.append('columns[]', col);
+  let limit = WIRE_PAGE_SIZE;
+  let page = 1;
+  let columns = ['t', 'a', 's', 'y', 'p', 'i'];
+  let objects = ['f', 'e', 's', 'a', 'p', 'w'];
+  let topics = ['l', 'f'];
+
+  if (typeof optionsOrLimit === 'number') {
+    limit = clampLimit(optionsOrLimit);
+  } else if (optionsOrLimit && typeof optionsOrLimit === 'object') {
+    if (Number.isFinite(optionsOrLimit.limit)) limit = clampLimit(optionsOrLimit.limit);
+    if (Number.isFinite(optionsOrLimit.page) && optionsOrLimit.page > 1) page = Math.floor(optionsOrLimit.page);
+    if (Array.isArray(optionsOrLimit.columns) && optionsOrLimit.columns.length > 0) columns = optionsOrLimit.columns;
+    if (Array.isArray(optionsOrLimit.objects) && optionsOrLimit.objects.length > 0) objects = optionsOrLimit.objects;
+    else objects = ['f']; // Default to files for modern queries
+    if (Array.isArray(optionsOrLimit.topics) && optionsOrLimit.topics.length > 0) topics = optionsOrLimit.topics;
   }
 
-  // Objects: files (f), editions (e), series (s), authors (a), publishers (p), works (w)
-  for (const obj of ['f', 'e', 's', 'a', 'p', 'w']) {
-    params.append('objects[]', obj);
-  }
+  for (const col of columns) params.append('columns[]', col);
+  for (const obj of objects) params.append('objects[]', obj);
+  for (const top of topics) params.append('topics[]', top);
 
-  // Topics: l = libgen (non-fiction), f = fiction
-  params.append('topics[]', 'l');
-  params.append('topics[]', 'f');
-
-  params.set('res', String(clampLimit(limit)));
+  params.set('res', String(limit));
   params.set('filesuns', 'all');
+  if (page > 1) params.set('page', String(page));
 
   url.search = params.toString();
   return url.toString();
+}
+
+const ISO_639_2_TO_1 = {
+  ara: 'ar', bul: 'bg', cat: 'ca', chi: 'zh', zho: 'zh',
+  ces: 'cs', cze: 'cs', dan: 'da', nld: 'nl', dut: 'nl',
+  eng: 'en', epo: 'eo', fin: 'fi', fra: 'fr', fre: 'fr',
+  deu: 'de', ger: 'de', ell: 'el', gre: 'el', heb: 'he',
+  hun: 'hu', ita: 'it', jpn: 'ja', lat: 'la', nor: 'no',
+  pol: 'pl', por: 'pt', ron: 'ro', rum: 'ro', rus: 'ru',
+  srp: 'sr', spa: 'es', swe: 'sv', tgl: 'tl', tur: 'tr',
+  ukr: 'uk',
+};
+
+function normalizeLanguageSubtag(langStr) {
+  if (!langStr || typeof langStr !== 'string') return undefined;
+  const primary = langStr.trim().split(/[-_]/)[0].toLowerCase();
+  if (primary.length === 2) return primary;
+  if (primary.length === 3) return ISO_639_2_TO_1[primary] || primary;
+  return undefined;
+}
+
+function languagesAgree(requested, released) {
+  if (!requested || !released) return true; // Permissive acceptance of missing metadata
+  const normReq = normalizeLanguageSubtag(requested);
+  const normRel = normalizeLanguageSubtag(released);
+  if (!normReq || !normRel) return true;
+  return normReq === normRel;
+}
+
+/**
+ * Validates ISBN-10 and ISBN-13 syntax and mathematical checksums.
+ *
+ * @param {string} raw - Raw ISBN string with hyphens or whitespace
+ * @returns {{ valid: boolean, clean: string, type: 'isbn10'|'isbn13'|null }}
+ */
+function validateIsbn(raw) {
+  if (!raw || typeof raw !== 'string') return { valid: false, clean: '', type: null };
+  const clean = raw.replace(/[\s-]/g, '').toUpperCase();
+
+  // ISBN-10 validation: 9 digits + 1 check digit (0-9 or X)
+  if (/^[0-9]{9}[0-9X]$/.test(clean)) {
+    let sum = 0;
+    for (let i = 0; i < 9; i++) {
+      sum += parseInt(clean[i], 10) * (10 - i);
+    }
+    const lastChar = clean[9];
+    sum += lastChar === 'X' ? 10 : parseInt(lastChar, 10);
+    if (sum % 11 === 0) {
+      return { valid: true, clean, type: 'isbn10' };
+    }
+  }
+
+  // ISBN-13 validation: 13 digits, prefix 978 or 979
+  if (/^(978|979)[0-9]{10}$/.test(clean)) {
+    let sum = 0;
+    for (let i = 0; i < 12; i++) {
+      sum += parseInt(clean[i], 10) * (i % 2 === 0 ? 1 : 3);
+    }
+    const checkDigit = (10 - (sum % 10)) % 10;
+    if (checkDigit === parseInt(clean[12], 10)) {
+      return { valid: true, clean, type: 'isbn13' };
+    }
+  }
+
+  return { valid: false, clean: '', type: null };
+}
+
+/**
+ * Classifies query inputs to distinguish bare ISBN searches from hybrid searches.
+ *
+ * @param {any} query - Query object or string
+ * @param {any} host - Host adapter
+ * @returns {{ isbnVal: object, searchText: string, isIsbnOnly: boolean, hasMeaningfulText: boolean }}
+ */
+function classifyQueryInputs(query, host) {
+  const rawQuery = typeof query === 'string' ? query : '';
+  const rawIsbn = query?.isbn13 || query?.isbn || rawQuery;
+  const isbnVal = validateIsbn(rawIsbn);
+
+  const hostSearchText = typeof host?.buildSearchText === 'function' ? host.buildSearchText(query) : '';
+  const candidateText = hostSearchText || query?.searchText || query?.title || rawQuery || '';
+  const cleanText = candidateText.trim();
+  const normalizedCandidate = cleanText.replace(/[\s-]/g, '').toUpperCase();
+
+  const isTextSolelyIsbn = isbnVal.valid && normalizedCandidate === isbnVal.clean;
+  const hasMeaningfulText = cleanText.length > 0 && !isTextSolelyIsbn;
+  const isIsbnOnly = isbnVal.valid && !hasMeaningfulText;
+
+  return {
+    isbnVal,
+    searchText: hasMeaningfulText ? cleanText : '',
+    isIsbnOnly,
+    hasMeaningfulText,
+  };
+}
+
+class SearchBudgetTracker {
+  /**
+   * @param {number} budgetMs - Total time budget in ms (clamped 1000-18000, default 15000)
+   * @param {AbortSignal} [hostSignal] - Host deadline signal
+   * @param {() => number} [nowFn] - Monotonic clock provider (default: performance.now)
+   */
+  constructor(budgetMs = DEFAULT_SEARCH_BUDGET_MS, hostSignal = null, nowFn = () => performance.now()) {
+    const raw = Number(budgetMs);
+    this.budgetMs = Number.isFinite(raw)
+      ? Math.max(MIN_SEARCH_BUDGET_MS, Math.min(MAX_SEARCH_BUDGET_MS, Math.floor(raw)))
+      : DEFAULT_SEARCH_BUDGET_MS;
+    this.hostSignal = hostSignal;
+    this.now = nowFn;
+    this.startedAt = this.now();
+    this.slowestPageMs = 0;
+    this.pagesRead = 0;
+  }
+
+  remainingMs() {
+    if (this.hostSignal?.aborted) return 0;
+    const elapsed = this.now() - this.startedAt;
+    return Math.max(0, this.budgetMs - elapsed);
+  }
+
+  isExhausted() {
+    return this.remainingMs() <= 0;
+  }
+
+  recordPageDuration(durationMs) {
+    this.pagesRead += 1;
+    this.slowestPageMs = Math.max(this.slowestPageMs, Math.max(0, durationMs));
+  }
+
+  /**
+   * Requires strictly positive budget and enough predicted time for the next page.
+   * Never permits equality or zero remaining time.
+   */
+  canAffordNextPage() {
+    if (this.hostSignal?.aborted) return false;
+    const remaining = this.remainingMs();
+    if (remaining <= MIN_PAGE_BUDGET_MS) return false;
+    const predictedNeed = this.pagesRead === 0 ? MIN_PAGE_BUDGET_MS : Math.max(MIN_PAGE_BUDGET_MS, this.slowestPageMs);
+    return remaining > predictedNeed;
+  }
 }
 
 /**
@@ -822,142 +989,419 @@ function extractGetLink(html, baseUrl, targetMd5) {
 }
 
 /**
- * Executes book search across mirrors with fallback failover.
+ * Executes a single search pass across pages on a specific mirror.
+ *
+ * @param {string} mirror - Canonical base origin (e.g. 'https://libgen.bz')
+ * @param {object} pass - Pass descriptor: { name: 'isbn'|'text', req: string, columns: string[], maxPages: number, cap: number }
+ * @param {any} query - Query object or string
+ * @param {any} config - Plugin configuration object
+ * @param {any} host - Host adapter
+ * @param {AbortSignal} callerSignal - Host deadline cancellation signal
+ * @param {SearchBudgetTracker} tracker - Monotonic deadline budget tracker
+ * @param {{ releases: any[], seenGuids: Set<string> }} accumulator - Central candidate accumulator
+ * @returns {Promise<{ status: 'success'|'empty'|'unsupported_only'|'budget_exhausted'|'error'|'caller_aborted', errorKind?: string, errorDetail?: string, candidatesAdded: number, pagesRead: number }>}
  */
-async function search(query, config, host, signal) {
-  const mirrors = allMirrors(config);
-  const searchText = typeof host?.buildSearchText === 'function'
-    ? host.buildSearchText(query)
-    : (query?.searchText || query?.title || (typeof query === 'string' ? query : ''));
-  if (!searchText) return [];
-
-  const limit = clampLimit(query?.limit ?? 25);
-  const mirrorOutcomes = [];
-  let sawEmptyOrUnsupportedMirror = false;
-  let terminalCancellation = null;
-
+async function readPass(mirror, pass, query, config, host, callerSignal, tracker, accumulator) {
   const mirrorTimeoutSetting = Number(config?.settings?.timeoutMs);
   const perMirrorTimeout = Number.isFinite(mirrorTimeoutSetting) && mirrorTimeoutSetting > 0
     ? mirrorTimeoutSetting
     : DEFAULT_MIRROR_TIMEOUT_MS;
 
-  for (const mirror of mirrors) {
-    if (signal?.aborted) {
-      terminalCancellation = new Error('Host deadline aborted');
-      break;
+  let candidatesAddedThisPass = 0;
+  let pagesReadThisPass = 0;
+
+  for (let page = 1; page <= pass.maxPages; page++) {
+    // 1. Caller cancellation check
+    if (callerSignal?.aborted) {
+      return { status: 'caller_aborted', candidatesAdded: candidatesAddedThisPass, pagesRead: pagesReadThisPass };
     }
 
-    const bounded = createBoundedRequestSignal(signal, perMirrorTimeout);
+    // 2. Budget check (Pre-fetch & Post-fetch): require strictly positive budget
+    if (!tracker.canAffordNextPage()) {
+      return { status: 'budget_exhausted', candidatesAdded: candidatesAddedThisPass, pagesRead: pagesReadThisPass };
+    }
+
+    const remainingBudget = tracker.remainingMs();
+    if (remainingBudget <= MIN_PAGE_BUDGET_MS) {
+      return { status: 'budget_exhausted', candidatesAdded: candidatesAddedThisPass, pagesRead: pagesReadThisPass };
+    }
+
+    const attemptTimeout = Math.min(perMirrorTimeout, remainingBudget);
+    if (attemptTimeout <= 0) {
+      return { status: 'budget_exhausted', candidatesAdded: candidatesAddedThisPass, pagesRead: pagesReadThisPass };
+    }
+
+    const bounded = createBoundedRequestSignal(callerSignal, attemptTimeout);
     let response;
+    const pageStartTime = tracker.now();
 
     try {
-      const searchUrl = buildSearchUrl(mirror, searchText, limit);
+      const searchUrl = buildSearchUrl(mirror, pass.req, {
+        page,
+        columns: pass.columns,
+        limit: WIRE_PAGE_SIZE,
+      });
+
       response = await bounded.run(() => host.fetch(searchUrl, {
         headers: BROWSER_HEADERS,
       }));
 
+      // HTTP non-OK response status handling
       if (!response.ok) {
-        mirrorOutcomes.push({
-          mirror,
-          kind: response.status === 429 ? 'throttled' : (response.status === 504 ? 'timeout' : 'http_error'),
-          status: response.status,
-        });
-        continue;
+        const errorKind = response.status === 429
+          ? 'throttled'
+          : (response.status === 504 ? 'timeout' : 'http_error');
+        const errorDetail = `HTTP ${response.status}`;
+
+        if (page === 1) {
+          return {
+            status: 'error',
+            errorKind,
+            errorDetail,
+            candidatesAdded: 0,
+            pagesRead: pagesReadThisPass,
+          };
+        }
+        // page > 1
+        if (accumulator.releases.length > 0) {
+          return {
+            status: 'success',
+            candidatesAdded: candidatesAddedThisPass,
+            pagesRead: pagesReadThisPass,
+          };
+        }
+        return {
+          status: 'error',
+          errorKind,
+          errorDetail,
+          candidatesAdded: 0,
+          pagesRead: pagesReadThisPass,
+        };
       }
 
       const responseUrl = validateHttpUrlString(response.url, searchUrl);
       const html = await bounded.run(() => readBoundedHtml(response));
 
-      // Scoped empty-catalog detection: strictly within identified results containers
+      // Record elapsed page duration into tracker
+      const duration = tracker.now() - pageStartTime;
+      tracker.recordPageDuration(duration);
+      pagesReadThisPass++;
+
+      // Scoped empty check
       const paginatorMatch = /<div\b[^>]*id=["']paginator["'][^>]*>([\s\S]*?)<\/div>/i.exec(html);
       const isPositivelyIdentifiedEmpty = paginatorMatch && /no books found|nothing found|0 files found/i.test(paginatorMatch[1]);
 
       const { items, tableFound, dataRowCount, rejectedCount } = parseSearchResults(html, responseUrl);
 
-      // Case 1: Unrecognized page structure (no table and no empty container)
+      // Guard 1: Unrecognized HTML (Challenge / Login Page / Wrong Layout)
       if (!tableFound && !isPositivelyIdentifiedEmpty) {
-        mirrorOutcomes.push({ mirror, kind: 'unrecognized', detail: 'Missing tablelibgen and results container' });
-        continue;
-      }
-
-      // Case 2: Table found, but all data rows failed parsing -> parser regression!
-      if (tableFound && dataRowCount > 0 && items.length === 0) {
-        mirrorOutcomes.push({ mirror, kind: 'parser_error', detail: `Rejected ${rejectedCount}/${dataRowCount} rows` });
-        continue;
-      }
-
-      // Case 3: Valid rows parsed -> takes precedence over paginator text!
-      if (items.length > 0) {
-        const releases = items
-          .filter(item => PREFERRED_EXTENSIONS.has(item.format))
-          .slice(0, limit)
-          .map(item => toRelease(item, mirror));
-
-        if (releases.length > 0) {
-          return releases; // Success!
+        if (page === 1) {
+          return {
+            status: 'error',
+            errorKind: 'unrecognized',
+            errorDetail: 'Missing tablelibgen and results container',
+            candidatesAdded: 0,
+            pagesRead: pagesReadThisPass,
+          };
         }
-
-        // Valid items present, but none in preferred formats
-        sawEmptyOrUnsupportedMirror = true;
-        continue;
+        if (accumulator.releases.length > 0) {
+          return {
+            status: 'success',
+            candidatesAdded: candidatesAddedThisPass,
+            pagesRead: pagesReadThisPass,
+          };
+        }
+        return {
+          status: 'error',
+          errorKind: 'unrecognized',
+          errorDetail: 'Missing tablelibgen and results container',
+          candidatesAdded: 0,
+          pagesRead: pagesReadThisPass,
+        };
       }
 
-      // Case 4: Verified empty catalog on this mirror (0 data rows or recognized empty marker)
-      if (isPositivelyIdentifiedEmpty || (tableFound && dataRowCount === 0)) {
-        sawEmptyOrUnsupportedMirror = true;
-        continue;
+      // Guard 2: Parser Regression Detection
+      if (tableFound && dataRowCount > 0 && items.length === 0) {
+        if (page === 1) {
+          return {
+            status: 'error',
+            errorKind: 'parser_error',
+            errorDetail: `Rejected ${rejectedCount}/${dataRowCount} rows`,
+            candidatesAdded: 0,
+            pagesRead: pagesReadThisPass,
+          };
+        }
+        if (accumulator.releases.length > 0) {
+          return {
+            status: 'success',
+            candidatesAdded: candidatesAddedThisPass,
+            pagesRead: pagesReadThisPass,
+          };
+        }
+        return {
+          status: 'error',
+          errorKind: 'parser_error',
+          errorDetail: `Rejected ${rejectedCount}/${dataRowCount} rows`,
+          candidatesAdded: 0,
+          pagesRead: pagesReadThisPass,
+        };
       }
-    } catch (err) {
-      // 1. Caller deadline cancellation (terminal)
-      if (signal?.aborted || (bounded.isCallerAborted() && !bounded.isLocalTimeout())) {
-        terminalCancellation = err;
+
+      // Guard 3: Valid Items Strict Precedence
+      if (items.length > 0) {
+        // Disregard contradictory empty text because items exist!
+        const accepted = items.filter(item =>
+          languagesAgree(query?.language, item.language) &&
+          PREFERRED_EXTENSIONS.has(item.format)
+        );
+
+        for (const item of accepted) {
+          if (!accumulator.seenGuids.has(item.md5)) {
+            accumulator.seenGuids.add(item.md5);
+            accumulator.releases.push(toRelease(item, mirror));
+            candidatesAddedThisPass++;
+          }
+          if (accumulator.releases.length >= pass.cap) {
+            return {
+              status: 'success',
+              candidatesAdded: candidatesAddedThisPass,
+              pagesRead: pagesReadThisPass,
+            };
+          }
+        }
+      }
+
+      // Guard 4: Verified Empty Catalog on Page 1
+      if (items.length === 0 && page === 1 && (isPositivelyIdentifiedEmpty || (tableFound && dataRowCount === 0))) {
+        return {
+          status: 'empty',
+          candidatesAdded: 0,
+          pagesRead: pagesReadThisPass,
+        };
+      }
+
+      // Guard 5: Pagination Continuation & Affirmative Exhaustion
+      if (dataRowCount < WIRE_PAGE_SIZE) {
+        // Short raw page: catalog affirmatively exhausted
         break;
       }
-
-      // 2. Request-local socket timeout or AbortError (retryable across mirrors)
-      const isTimeout = bounded.isLocalTimeout() ||
-                        err?.name === 'TimeoutError' ||
-                        (err?.name === 'AbortError' && !signal?.aborted);
-
-      if (isTimeout) {
-        mirrorOutcomes.push({
-          mirror,
-          kind: 'timeout',
-          detail: `Mirror attempt timed out (${perMirrorTimeout}ms)`,
-        });
-        continue;
+      // If dataRowCount === WIRE_PAGE_SIZE, continue to next page!
+    } catch (err) {
+      if (callerSignal?.aborted || (bounded.isCallerAborted() && !bounded.isLocalTimeout())) {
+        return { status: 'caller_aborted', candidatesAdded: candidatesAddedThisPass, pagesRead: pagesReadThisPass };
       }
 
-      mirrorOutcomes.push({ mirror, kind: 'transport_error', detail: sanitizeErrorDiagnostics(err) });
+      const isTimeout = bounded.isLocalTimeout() ||
+                        err?.name === 'TimeoutError' ||
+                        (err?.name === 'AbortError' && !callerSignal?.aborted);
+
+      const errorKind = isTimeout ? 'timeout' : 'transport_error';
+      const errorDetail = sanitizeErrorDiagnostics(err);
+
+      if (page === 1) {
+        return {
+          status: 'error',
+          errorKind,
+          errorDetail,
+          candidatesAdded: 0,
+          pagesRead: pagesReadThisPass,
+        };
+      }
+      if (accumulator.releases.length > 0) {
+        return {
+          status: 'success',
+          candidatesAdded: candidatesAddedThisPass,
+          pagesRead: pagesReadThisPass,
+        };
+      }
+      return {
+        status: 'error',
+        errorKind,
+        errorDetail,
+        candidatesAdded: 0,
+        pagesRead: pagesReadThisPass,
+      };
     } finally {
       bounded.cleanup();
       discardResponse(response);
     }
   }
 
-  // The host adapter races search against its caller deadline; never try another mirror after cancellation.
-  if (signal?.aborted || terminalCancellation) {
+  if (candidatesAddedThisPass > 0) {
+    return { status: 'success', candidatesAdded: candidatesAddedThisPass, pagesRead: pagesReadThisPass };
+  }
+  return { status: 'unsupported_only', candidatesAdded: 0, pagesRead: pagesReadThisPass };
+}
+
+/**
+ * Executes two-pass book search across mirrors with monotonic deadline tracking.
+ */
+async function search(query, config, host, signal) {
+  if (signal?.aborted) return [];
+
+  const mirrors = allMirrors(config);
+  const { isbnVal, searchText, isIsbnOnly, hasMeaningfulText } = classifyQueryInputs(query, host);
+
+  if (!isbnVal.valid && !hasMeaningfulText) {
     return [];
   }
 
-  // If at least one responsive mirror verified an empty catalog or unsupported-only candidates
-  if (sawEmptyOrUnsupportedMirror) {
+  const limit = clampLimit(query?.limit ?? 25);
+
+  const rawMaxPages = Number(config?.settings?.maxPages);
+  const maxPages = Number.isFinite(rawMaxPages)
+    ? Math.max(1, Math.min(10, Math.floor(rawMaxPages)))
+    : DEFAULT_MAX_PAGES;
+
+  const rawBudget = Number(config?.settings?.searchBudgetMs);
+  const searchBudgetMs = Number.isFinite(rawBudget)
+    ? Math.max(MIN_SEARCH_BUDGET_MS, Math.min(MAX_SEARCH_BUDGET_MS, Math.floor(rawBudget)))
+    : DEFAULT_SEARCH_BUDGET_MS;
+
+  const nowFn = typeof config?._nowFn === 'function' ? config._nowFn : () => performance.now();
+  const tracker = new SearchBudgetTracker(searchBudgetMs, signal, nowFn);
+
+  // Set up passes
+  let pass1 = null;
+  let pass2 = null;
+
+  if (isIsbnOnly) {
+    pass1 = {
+      name: 'isbn',
+      req: isbnVal.clean,
+      columns: ['i'],
+      maxPages: 1,
+      cap: limit,
+    };
+  } else if (isbnVal.valid && hasMeaningfulText) {
+    pass1 = {
+      name: 'isbn',
+      req: isbnVal.clean,
+      columns: ['i'],
+      maxPages: 1,
+      cap: Math.max(1, Math.floor(limit * 0.5)),
+    };
+    pass2 = {
+      name: 'text',
+      req: searchText,
+      columns: ['t', 'a'],
+      maxPages,
+      cap: limit,
+    };
+  } else {
+    pass2 = {
+      name: 'text',
+      req: searchText,
+      columns: ['t', 'a'],
+      maxPages,
+      cap: limit,
+    };
+  }
+
+  const accumulator = { releases: [], seenGuids: new Set() };
+  const passStatus = { isbn: pass1 ? 'not_run' : 'skipped', text: pass2 ? 'not_run' : 'skipped' };
+  const isPassDone = status => status === 'success' || status === 'empty' || status === 'unsupported_only';
+  const mirrorOutcomes = [];
+  let budgetPreempted = false;
+
+  for (const mirror of mirrors) {
+    if (signal?.aborted) break;
+    if (!tracker.canAffordNextPage()) {
+      budgetPreempted = true;
+      break;
+    }
+
+    // Pass 1 execution
+    if (pass1 && !isPassDone(passStatus.isbn)) {
+      const res1 = await readPass(mirror, pass1, query, config, host, signal, tracker, accumulator);
+      passStatus.isbn = res1.status;
+
+      if (res1.status === 'caller_aborted' || res1.status === 'budget_exhausted') break;
+
+      if (res1.status === 'error') {
+        mirrorOutcomes.push({ mirror, pass: 'isbn', kind: res1.errorKind, detail: res1.errorDetail });
+        // Retry Pass 1 on next mirror
+        continue;
+      }
+
+      if (res1.status === 'success' && accumulator.releases.length >= limit) {
+        return accumulator.releases.slice(0, limit);
+      }
+    }
+
+    // Pass 2 execution
+    const pass1Done = !pass1 || isPassDone(passStatus.isbn);
+    if (pass2 && !isPassDone(passStatus.text) && pass1Done) {
+      if (accumulator.releases.length >= limit) {
+        break;
+      }
+
+      const res2 = await readPass(mirror, pass2, query, config, host, signal, tracker, accumulator);
+      passStatus.text = res2.status;
+
+      if (res2.status === 'caller_aborted' || res2.status === 'budget_exhausted') break;
+
+      if (res2.status === 'error') {
+        mirrorOutcomes.push({ mirror, pass: 'text', kind: res2.errorKind, detail: res2.errorDetail });
+        // Retry Pass 2 on next mirror
+        continue;
+      }
+
+      if (isPassDone(res2.status)) {
+        // All clean completions are terminal, including empty and filtered pages.
+        break;
+      }
+    }
+
+    // Check if search can complete early
+    const pass1Complete = !pass1 || isPassDone(passStatus.isbn);
+    const pass2Complete = !pass2 || isPassDone(passStatus.text);
+    if (pass1Complete && pass2Complete) {
+      break;
+    }
+  }
+
+  // Outcome A: Caller Cancellation
+  if (signal?.aborted || passStatus.isbn === 'caller_aborted' || passStatus.text === 'caller_aborted') {
     return [];
   }
 
-  // Synthesize structured diagnostics
-  const allThrottled = mirrorOutcomes.length > 0 && mirrorOutcomes.every(o => o.kind === 'throttled');
-  if (allThrottled) {
-    throw fail(host, 'throttled', 'All Libgen mirrors returned 429 Throttled');
+  // Outcome B: Successful Results (Full or Partial)
+  if (accumulator.releases.length > 0) {
+    return accumulator.releases.slice(0, limit);
   }
 
-  const allTimedOut = mirrorOutcomes.length > 0 && mirrorOutcomes.every(o => o.kind === 'timeout');
-  if (allTimedOut) {
-    throw fail(host, 'timeout', 'All Libgen mirrors timed out');
+  // Outcome C: Budget Preemption with Zero Candidates
+  if (budgetPreempted || passStatus.isbn === 'budget_exhausted' || passStatus.text === 'budget_exhausted') {
+    throw fail(host, 'timeout', 'Search deadline budget exhausted');
   }
 
-  const summary = mirrorOutcomes.map(o => `${o.mirror}: ${o.kind}${o.status ? ` (${o.status})` : ''}${o.detail ? ` (${o.detail})` : ''}`).join('; ');
-  throw fail(host, 'unreachable', `Libgen search failed across all mirrors: ${summary || 'unknown error'}`);
+  // Outcome D: Error with Zero Candidates (Including Mixed Empty / Error & Exhausted Hybrid ISBN Failures)
+  const anyPassErrored = passStatus.isbn === 'error' || passStatus.text === 'error';
+  if (accumulator.releases.length === 0 && anyPassErrored) {
+    const allThrottled = mirrorOutcomes.length > 0 && mirrorOutcomes.every(o => o.kind === 'throttled');
+    if (allThrottled) {
+      throw fail(host, 'throttled', 'All Libgen mirrors returned 429 Throttled');
+    }
+
+    const allTimedOut = mirrorOutcomes.length > 0 && mirrorOutcomes.every(o => o.kind === 'timeout');
+    if (allTimedOut) {
+      throw fail(host, 'timeout', 'All Libgen mirrors timed out');
+    }
+
+    const allParserErrors = mirrorOutcomes.length > 0 && mirrorOutcomes.every(o => o.kind === 'parser_error');
+    if (allParserErrors) {
+      throw fail(host, 'parser_error', 'Libgen search table format regression across all mirrors');
+    }
+
+    const summary = mirrorOutcomes
+      .map(o => `${o.mirror}: ${o.kind}${o.detail ? ` (${o.detail})` : ''}`)
+      .join('; ');
+    throw fail(host, 'unreachable', `Libgen search failed across all mirrors: ${summary || 'unknown error'}`);
+  }
+
+  // Outcome E: Verified Clean Completion (Empty and/or Unsupported)
+  return [];
 }
 
 /**
@@ -1107,12 +1551,13 @@ async function test(config, host) {
 
 const plugin = {
   apiVersion: 1,
-  version: '0.1.0',
+  version: '0.2.0',
   type: 'libgen',
   label: 'Library Genesis (libgen.li / libgen.bz)',
   requiresCredential: false,
   credentialKind: null,
   mediaKinds: ['ebook'],
+  supportsIsbnSearch: true,
   usesCategories: false,
   seedsBack: false,
   defaultBaseUrl: 'https://libgen.bz',
@@ -1138,6 +1583,20 @@ const plugin = {
       label: 'Maximum mirror attempts',
       hint: 'Maximum number of mirrors to try per search (clamped between 1 and 10).',
       default: 3,
+    },
+    {
+      key: 'maxPages',
+      type: 'number',
+      label: 'Maximum search pages to walk',
+      hint: 'Maximum pagination depth per search pass (1-10). Default 4.',
+      default: 4,
+    },
+    {
+      key: 'searchBudgetMs',
+      type: 'number',
+      label: 'Total search deadline budget (ms)',
+      hint: 'Self-imposed ceiling for two-pass search across all pages (1000-18000 ms). Default 15000 ms.',
+      default: 15000,
     },
   ],
 
@@ -1180,6 +1639,19 @@ export {
   hasConflictingOrDuplicateMd5,
   createBoundedRequestSignal,
   extractRowMd5,
+  WIRE_PAGE_SIZE,
+  DEFAULT_MAX_PAGES,
+  DEFAULT_SEARCH_BUDGET_MS,
+  MIN_SEARCH_BUDGET_MS,
+  MAX_SEARCH_BUDGET_MS,
+  MIN_PAGE_BUDGET_MS,
+  ISO_639_2_TO_1,
+  normalizeLanguageSubtag,
+  languagesAgree,
+  validateIsbn,
+  classifyQueryInputs,
+  SearchBudgetTracker,
+  readPass,
 };
 
 export const _internal = {
@@ -1212,4 +1684,17 @@ export const _internal = {
   hasConflictingOrDuplicateMd5,
   createBoundedRequestSignal,
   extractRowMd5,
+  WIRE_PAGE_SIZE,
+  DEFAULT_MAX_PAGES,
+  DEFAULT_SEARCH_BUDGET_MS,
+  MIN_SEARCH_BUDGET_MS,
+  MAX_SEARCH_BUDGET_MS,
+  MIN_PAGE_BUDGET_MS,
+  ISO_639_2_TO_1,
+  normalizeLanguageSubtag,
+  languagesAgree,
+  validateIsbn,
+  classifyQueryInputs,
+  SearchBudgetTracker,
+  readPass,
 };
