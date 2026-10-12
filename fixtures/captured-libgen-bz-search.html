@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Library Genesis: Search Results</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="header">
+  <div class="logo">
+    <a href="/"><h1>Library Genesis</h1></a>
+  </div>
+  <form action="index.php" method="get">
+    <input type="text" name="req" value="Hyperion Dan Simmons" size="50">
+    <input type="submit" value="Search">
+    <input type="hidden" name="columns[]" value="t">
+    <input type="hidden" name="objects[]" value="f">
+    <input type="hidden" name="topics[]" value="l">
+    <input type="hidden" name="topics[]" value="f">
+    <input type="hidden" name="res" value="25">
+    <input type="hidden" name="filesuns" value="all">
+  </form>
+</div>
+
+<div id="paginator">
+  <span>Found 2 files</span>
+  <span class="pages">Page: <b>1</b></span>
+</div>
+
+<table id="tablelibgen" class="table table-striped">
+  <thead>
+    <tr>
+      <th class="cover">Cover</th>
+      <th>Title</th>
+      <th>Author(s)</th>
+      <th>Publisher</th>
+      <th>Year</th>
+      <th>Language</th>
+      <th>Pages</th>
+      <th>Size</th>
+      <th>Extension</th>
+      <th>Mirrors</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="cover"><img src="/covers/c1111111111111111111111111111111.jpg" alt="cover"></td>
+      <td><a href="/book/index.php?md5=c1111111111111111111111111111111">Hyperion (Hyperion Cantos)</a></td>
+      <td><a href="/index.php?req=Dan+Simmons">Dan Simmons</a></td>
+      <td>Spectra</td>
+      <td>1989</td>
+      <td>English</td>
+      <td>482</td>
+      <td>1.8 MB</td>
+      <td>epub</td>
+      <td>
+        <a href="ads.php?md5=c1111111111111111111111111111111">[1]</a>
+        <a href="https://library.lol/main/c1111111111111111111111111111111">[2]</a>
+      </td>
+    </tr>
+    <tr>
+      <td class="cover"><img src="/covers/c2222222222222222222222222222222.jpg" alt="cover"></td>
+      <td><a href="/main/c2222222222222222222222222222222">The Fall of Hyperion</a></td>
+      <td><a href="/index.php?req=Dan+Simmons">Dan Simmons</a></td>
+      <td>Doubleday</td>
+      <td>1990</td>
+      <td>English</td>
+      <td>528</td>
+      <td>2.4 MB</td>
+      <td>pdf</td>
+      <td>
+        <a href="ads.php?md5=c2222222222222222222222222222222">[1]</a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="footer">
+  <p>&copy; 2026 Library Genesis. All files hosted across decentralized catalog mirrors.</p>
+</div>
+</body>
+</html>
