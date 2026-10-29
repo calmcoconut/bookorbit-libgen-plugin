@@ -1127,6 +1127,64 @@ async function runAllTests() {
     assert.equal(empty.hasMeaningfulText, false);
   });
 
+  await test('classifyQueryInputs: host echo of ISBN falls back to title + author', () => {
+    const echo = classifyQueryInputs(
+      { isbn13: '9780306406157', title: 'Dune', author: 'Frank Herbert' },
+      { buildSearchText: () => '9780306406157' }
+    );
+    assert.equal(echo.hasMeaningfulText, true);
+    assert.equal(echo.searchText, 'Dune Frank Herbert');
+    assert.equal(echo.isIsbnOnly, false);
+    assert.equal(echo.isbnVal.valid, true);
+
+    // Invalid checksum ISBN is not used as text; title is used instead
+    const badChecksum = classifyQueryInputs(
+      { isbn13: '9780306406158', title: 'Dune' },
+      { buildSearchText: () => '9780306406158' }
+    );
+    assert.equal(badChecksum.isbnVal.valid, false);
+    assert.equal(badChecksum.searchText, 'Dune');
+    assert.equal(badChecksum.hasMeaningfulText, true);
+
+    // Invalid checksum ISBN with no title: no text, so search returns []
+    const badNoTitle = classifyQueryInputs(
+      { isbn13: '9780306406158' },
+      { buildSearchText: () => '9780306406158' }
+    );
+    assert.equal(badNoTitle.isbnVal.valid, false);
+    assert.equal(badNoTitle.hasMeaningfulText, false);
+    assert.equal(badNoTitle.searchText, '');
+
+    // No host: title + author are combined from the query object
+    const noHost = classifyQueryInputs(
+      { title: 'Dune', author: 'Frank Herbert', isbn13: '9780306406157' },
+      null
+    );
+    assert.equal(noHost.searchText, 'Dune Frank Herbert');
+    assert.equal(noHost.isIsbnOnly, false);
+
+    // Digit-only titles that are not the query's own ISBN stay as search text
+    const digitTitle13 = classifyQueryInputs(
+      { isbn13: '9780306406157', title: '9781234567897' },
+      null
+    );
+    assert.equal(digitTitle13.searchText, '9781234567897');
+    assert.equal(digitTitle13.isIsbnOnly, false);
+
+    const digitTitle10 = classifyQueryInputs({ title: '1234567890' }, null);
+    assert.equal(digitTitle10.searchText, '1234567890');
+    assert.equal(digitTitle10.hasMeaningfulText, true);
+
+    // 13 digits without a 978/979 prefix never have ISBN shape
+    const nonIsbn13 = classifyQueryInputs({ isbn13: '1234567890123', title: '1234567890123' }, null);
+    assert.equal(nonIsbn13.searchText, '1234567890123');
+
+    // Invalid-checksum string query with no declared ISBN is searched as text
+    const badString = classifyQueryInputs('9780306406158', null);
+    assert.equal(badString.isbnVal.valid, false);
+    assert.equal(badString.searchText, '9780306406158');
+  });
+
   await test('buildSearchUrl: wire page size, options object, column selection, and page param', () => {
     const base = 'https://libgen.bz';
     // Legacy numeric limit (res=15, full columns & objects, no page)
@@ -1911,6 +1969,37 @@ async function runAllTests() {
         return true;
       }
     );
+  });
+
+  await test('Two-Pass: host echoing ISBN with empty ISBN page falls back to title/author text pass', async () => {
+    const mockHost = createMockHost({
+      routes: [
+        {
+          pattern: (url) => url.includes('columns%5B%5D=i'),
+          handler: { fixture: 'empty-search.html', status: 200 },
+        },
+        {
+          pattern: 'https://libgen.bz',
+          handler: { fixture: 'search-covers-on.html', status: 200 },
+        },
+      ],
+    });
+    mockHost.buildSearchText = () => '9780306406157';
+
+    const cfg = { baseUrl: 'https://libgen.bz', settings: { fallbackMirrors: '' } };
+    const releases = await plugin.search(
+      { isbn13: '9780306406157', title: 'Dune', author: 'Frank Herbert', limit: 10 },
+      cfg,
+      mockHost
+    );
+    assert.equal(releases.length, 2);
+
+    const textCall = mockHost.calls.find(c => !c.url.includes('columns%5B%5D=i'));
+    assert(textCall, 'text pass request must be made');
+    const textUrl = new URL(textCall.url);
+    assert.equal(textUrl.searchParams.get('req'), 'Dune Frank Herbert');
+    assert(textUrl.searchParams.getAll('columns[]').includes('t'));
+    assert(textUrl.searchParams.getAll('columns[]').includes('a'));
   });
 
   await test('Error Classification: Network socket failure vs HTTP 500 vs 429 vs 504', async () => {

@@ -44,6 +44,7 @@ const MIN_ATTEMPTS = 1;
 const MAX_ATTEMPTS = 10;
 const DEFAULT_MIRROR_TIMEOUT_MS = 8000;
 const MD5_REGEX = /^[a-f0-9]{32}$/i;
+const ISBN_SHAPE_REGEX = /^(?:\d{9}[\dX]|97[89]\d{10})$/;
 const MAX_HTML_BYTES = 512 * 1024;
 const WIRE_PAGE_SIZE = 25;
 const DEFAULT_MAX_PAGES = 4;
@@ -578,19 +579,33 @@ function classifyQueryInputs(query, host) {
   const rawQuery = typeof query === 'string' ? query : '';
   const rawIsbn = query?.isbn13 || query?.isbn || rawQuery;
   const isbnVal = validateIsbn(rawIsbn);
+  const normalizeIsbnText = value => String(value ?? '').replace(/[\s-]/g, '').toUpperCase();
+  const declaredIsbn = normalizeIsbnText(query?.isbn13 || query?.isbn);
+
+  // Text is ignored as a text query only when it has ISBN-10/ISBN-13 shape AND is this
+  // query's own ISBN (including invalid-checksum ISBNs, issue #1). Digit-only titles
+  // that differ from the query's ISBN are kept.
+  const isIsbnLike = text => {
+    const normalized = normalizeIsbnText(text);
+    if (!ISBN_SHAPE_REGEX.test(normalized)) return false;
+    return (isbnVal.valid && normalized === isbnVal.clean) || normalized === declaredIsbn;
+  };
 
   const hostSearchText = typeof host?.buildSearchText === 'function' ? host.buildSearchText(query) : '';
-  const candidateText = hostSearchText || query?.searchText || query?.title || rawQuery || '';
-  const cleanText = candidateText.trim();
-  const normalizedCandidate = cleanText.replace(/[\s-]/g, '').toUpperCase();
+  const titleAuthor = [query?.title, query?.author]
+    .map(part => (typeof part === 'string' ? part.trim() : ''))
+    .filter(Boolean)
+    .join(' ');
+  const cleanText = [hostSearchText, query?.searchText, titleAuthor, rawQuery]
+    .map(candidate => (typeof candidate === 'string' ? candidate.trim() : ''))
+    .find(candidate => candidate && !isIsbnLike(candidate)) || '';
 
-  const isTextSolelyIsbn = isbnVal.valid && normalizedCandidate === isbnVal.clean;
-  const hasMeaningfulText = cleanText.length > 0 && !isTextSolelyIsbn;
+  const hasMeaningfulText = cleanText.length > 0;
   const isIsbnOnly = isbnVal.valid && !hasMeaningfulText;
 
   return {
     isbnVal,
-    searchText: hasMeaningfulText ? cleanText : '',
+    searchText: cleanText,
     isIsbnOnly,
     hasMeaningfulText,
   };

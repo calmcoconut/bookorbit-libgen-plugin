@@ -40,7 +40,7 @@ To keep memory usage low and protect against malformed mirror responses, the plu
 From this repository's root, with Node.js 22:
 
 ```bash
-node plugins/libgen/verify.mjs
+node verify.mjs
 ```
 
 ## AI usage disclosure
