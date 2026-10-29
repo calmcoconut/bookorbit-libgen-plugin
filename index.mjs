@@ -578,19 +578,32 @@ function classifyQueryInputs(query, host) {
   const rawQuery = typeof query === 'string' ? query : '';
   const rawIsbn = query?.isbn13 || query?.isbn || rawQuery;
   const isbnVal = validateIsbn(rawIsbn);
+  const normalizeIsbnText = value => String(value ?? '').replace(/[\s-]/g, '').toUpperCase();
+  const declaredIsbn = normalizeIsbnText(query?.isbn13 || query?.isbn);
+
+  // ISBN-like text is ignored as a text query, including invalid-checksum ISBNs (issue #1)
+  const isIsbnLike = text => {
+    const normalized = normalizeIsbnText(text);
+    return (isbnVal.valid && normalized === isbnVal.clean)
+      || /^(?:\d{9}[\dX]|\d{13})$/.test(normalized)
+      || (normalized !== '' && normalized === declaredIsbn);
+  };
 
   const hostSearchText = typeof host?.buildSearchText === 'function' ? host.buildSearchText(query) : '';
-  const candidateText = hostSearchText || query?.searchText || query?.title || rawQuery || '';
-  const cleanText = candidateText.trim();
-  const normalizedCandidate = cleanText.replace(/[\s-]/g, '').toUpperCase();
+  const titleAuthor = [query?.title, query?.author]
+    .map(part => (typeof part === 'string' ? part.trim() : ''))
+    .filter(Boolean)
+    .join(' ');
+  const cleanText = [hostSearchText, query?.searchText, titleAuthor, rawQuery]
+    .map(candidate => (typeof candidate === 'string' ? candidate.trim() : ''))
+    .find(candidate => candidate && !isIsbnLike(candidate)) || '';
 
-  const isTextSolelyIsbn = isbnVal.valid && normalizedCandidate === isbnVal.clean;
-  const hasMeaningfulText = cleanText.length > 0 && !isTextSolelyIsbn;
+  const hasMeaningfulText = cleanText.length > 0;
   const isIsbnOnly = isbnVal.valid && !hasMeaningfulText;
 
   return {
     isbnVal,
-    searchText: hasMeaningfulText ? cleanText : '',
+    searchText: cleanText,
     isIsbnOnly,
     hasMeaningfulText,
   };
