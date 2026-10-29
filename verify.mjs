@@ -1162,6 +1162,27 @@ async function runAllTests() {
     );
     assert.equal(noHost.searchText, 'Dune Frank Herbert');
     assert.equal(noHost.isIsbnOnly, false);
+
+    // Digit-only titles that are not the query's own ISBN stay as search text
+    const digitTitle13 = classifyQueryInputs(
+      { isbn13: '9780306406157', title: '9781234567897' },
+      null
+    );
+    assert.equal(digitTitle13.searchText, '9781234567897');
+    assert.equal(digitTitle13.isIsbnOnly, false);
+
+    const digitTitle10 = classifyQueryInputs({ title: '1234567890' }, null);
+    assert.equal(digitTitle10.searchText, '1234567890');
+    assert.equal(digitTitle10.hasMeaningfulText, true);
+
+    // 13 digits without a 978/979 prefix never have ISBN shape
+    const nonIsbn13 = classifyQueryInputs({ isbn13: '1234567890123', title: '1234567890123' }, null);
+    assert.equal(nonIsbn13.searchText, '1234567890123');
+
+    // Invalid-checksum string query with no declared ISBN is searched as text
+    const badString = classifyQueryInputs('9780306406158', null);
+    assert.equal(badString.isbnVal.valid, false);
+    assert.equal(badString.searchText, '9780306406158');
   });
 
   await test('buildSearchUrl: wire page size, options object, column selection, and page param', () => {

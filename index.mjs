@@ -44,6 +44,7 @@ const MIN_ATTEMPTS = 1;
 const MAX_ATTEMPTS = 10;
 const DEFAULT_MIRROR_TIMEOUT_MS = 8000;
 const MD5_REGEX = /^[a-f0-9]{32}$/i;
+const ISBN_SHAPE_REGEX = /^(?:\d{9}[\dX]|97[89]\d{10})$/;
 const MAX_HTML_BYTES = 512 * 1024;
 const WIRE_PAGE_SIZE = 25;
 const DEFAULT_MAX_PAGES = 4;
@@ -581,12 +582,13 @@ function classifyQueryInputs(query, host) {
   const normalizeIsbnText = value => String(value ?? '').replace(/[\s-]/g, '').toUpperCase();
   const declaredIsbn = normalizeIsbnText(query?.isbn13 || query?.isbn);
 
-  // ISBN-like text is ignored as a text query, including invalid-checksum ISBNs (issue #1)
+  // Text is ignored as a text query only when it has ISBN-10/ISBN-13 shape AND is this
+  // query's own ISBN (including invalid-checksum ISBNs, issue #1). Digit-only titles
+  // that differ from the query's ISBN are kept.
   const isIsbnLike = text => {
     const normalized = normalizeIsbnText(text);
-    return (isbnVal.valid && normalized === isbnVal.clean)
-      || /^(?:\d{9}[\dX]|\d{13})$/.test(normalized)
-      || (normalized !== '' && normalized === declaredIsbn);
+    if (!ISBN_SHAPE_REGEX.test(normalized)) return false;
+    return (isbnVal.valid && normalized === isbnVal.clean) || normalized === declaredIsbn;
   };
 
   const hostSearchText = typeof host?.buildSearchText === 'function' ? host.buildSearchText(query) : '';
